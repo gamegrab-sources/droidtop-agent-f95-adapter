@@ -1,0 +1,21 @@
+[package]
+name = "droidtop-agent-f95-adapter"
+description = "The F95 plugin's context adapter for droidtop-agent: F95Checker's watched threads kept in step with the handheld"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/gamegrab-sources/droidtop-agent-f95-adapter"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# F95Checker's db.sqlite3.
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,94 @@
+name: CI
+
+# Every push builds and tests the adapter on Windows, Linux and macOS. A green
+# push to main publishes a release with the three programs. Releases are
+# permanent history.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset: droidtop-agent-f95-adapter-linux-x86_64
+            exe: droidtop-agent-f95-adapter
+          - os: windows-latest
+            asset: droidtop-agent-f95-adapter-windows-x86_64.exe
+            exe: droidtop-agent-f95-adapter.exe
+          - os: macos-latest
+            asset: droidtop-agent-f95-adapter-macos-arm64
+            exe: droidtop-agent-f95-adapter
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: success() || failure()
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        if: success() || failure()
+        run: cargo test --no-fail-fast
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp "target/release/${{ matrix.exe }}" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish this build's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN: ${{ github.run_number }}
+        run: |
+          set -eu
+          tag="build-${RUN}"
+          ls -l dist
+          gh release create "$tag" dist/* --repo "$REPO" --target "$SHA" \
+            --title "Build ${RUN}" \
+            --notes "Built from ${SHA}. Add it with: droidtop-agent contexts add <path to the program>. See CHANGELOG.md."
