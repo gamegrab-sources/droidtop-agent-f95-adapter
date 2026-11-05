@@ -2,13 +2,18 @@
 //! droidtop-agent. It keeps F95Checker's watched threads on the computer in
 //! step with the F95 plugin on the handheld, as the `f95checker` context.
 //!
-//! The agent runs it once per pull or push and speaks JSON with it over
-//! standard input and output (droidtop-agent's docs/DESIGN.md section 8,
-//! adapter protocol 1):
-//! - `describe` prints `{"protocol": 1, "id": "f95checker", "description": ...}`;
-//! - `pull` prints `{"records": {<thread id>: {<field>: <value>}}}`;
-//! - `push` reads `{"changes": [...]}` and prints `{"deferred": null}`, or
-//!   `{"deferred": "<why>"}` while F95Checker is open;
+//! The agent runs it and speaks JSON with it over standard input and output
+//! (droidtop-agent's docs/DESIGN.md section 8, adapter protocol 2):
+//! - `describe` prints `{"protocol": 2, "id": "f95checker", "snapshot": true, ...}`;
+//! - `snapshot` prints `{"records": {<thread id>: {<field>: <value>}}}`, F95Checker's
+//!   threads now, which the agent publishes as the context's copy when they
+//!   changed, before a handheld reads it; it is remembered beside the database
+//!   as the base `received` merges against;
+//! - `received` reads `{"generation": n, "records": {...}}`, the merged copy, and
+//!   brings into F95Checker what the handheld changed since that snapshot,
+//!   printing `{"deferred": null}`, or `{"deferred": "<why>"}` while F95Checker is open;
+//! - `pull` and `push` stay for an agent or plugin that still syncs by
+//!   changes (protocol 1);
 //! - a failure prints `{"error": "..."}` and exits with 1.
 //!
 //! It reads only the `games` columns the context declares, never the
@@ -44,8 +49,16 @@ struct Push {
     changes: Vec<RecordChange>,
 }
 
+/// What `received` reads: the copy made current.
+#[derive(Deserialize)]
+struct Received {
+    #[allow(dead_code)]
+    generation: u64,
+    records: Records,
+}
+
 const CONTEXT: &str = "f95checker";
-const PROTOCOL: u64 = 1;
+const PROTOCOL: u64 = 2;
 
 fn main() {
     let verb = std::env::args().nth(1).unwrap_or_default();
@@ -55,8 +68,11 @@ fn main() {
         "describe" => Ok(json!({
             "protocol": PROTOCOL,
             "id": CONTEXT,
+            "snapshot": true,
             "description": "F95Checker's watched threads, for droidtop's F95 plugin",
         })),
+        "snapshot" => adapter.snapshot().map(|records| json!({ "records": records })),
+        "received" => read_input::<Received>("a copy").and_then(|r| adapter.received(r.records)).map(|deferred| json!({ "deferred": deferred })),
         "pull" => adapter.pull().map(|records| json!({ "records": records })),
         "push" => {
             let mut input = Vec::new();
@@ -67,7 +83,7 @@ fn main() {
                 .and_then(|p| adapter.push(p.changes))
                 .map(|deferred| json!({ "deferred": deferred }))
         }
-        _ => Err(format!("droidtop-agent-f95-adapter: run by droidtop-agent with describe, pull or push (got {verb:?}).\nAdd it with: droidtop-agent contexts add <path to this program>")),
+        _ => Err(format!("droidtop-agent-f95-adapter: run by droidtop-agent with describe, snapshot, received, pull or push (got {verb:?}).\nAdd it with: droidtop-agent contexts add <path to this program>")),
     };
     match reply {
         Ok(v) => println!("{v}"),
@@ -76,6 +92,47 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Reads the one JSON object the agent sends on standard input.
+fn read_input<T: serde::de::DeserializeOwned>(what: &str) -> Result<T, String> {
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&input).map_err(|e| format!("the agent sent {what} this adapter cannot read ({e})"))
+}
+
+/// The changes that bring into F95Checker what the handheld changed in
+/// [`copy`] since [`base`] (the last snapshot), leaving alone what changed in
+/// F95Checker itself since then ([`now`]): a field is written only when the
+/// copy's value differs from the base's, a thread is added only when neither
+/// the base nor F95Checker has it, and removed only when the base had it and
+/// the copy no longer does. Only the writable fields travel this way. Pure.
+fn changes_from(copy: &Records, base: &Records, now: &Records) -> Vec<RecordChange> {
+    let mut out = Vec::new();
+    for (id, record) in copy {
+        match (base.get(id), now.contains_key(id)) {
+            // Watched on the handheld: added with what the copy knows of it.
+            (None, false) => out.push(RecordChange::Upsert { key: id.clone(), fields: record.clone() }),
+            // Removed in F95Checker since the snapshot: that stands.
+            (Some(_), false) => {}
+            (was, true) => {
+                let fields: Record = record
+                    .iter()
+                    .filter(|(f, v)| WRITABLE.contains(&f.as_str()) && was.and_then(|b| b.get(*f)) != Some(*v))
+                    .map(|(f, v)| (f.clone(), v.clone()))
+                    .collect();
+                if !fields.is_empty() {
+                    out.push(RecordChange::Upsert { key: id.clone(), fields });
+                }
+            }
+        }
+    }
+    for id in now.keys() {
+        if base.contains_key(id) && !copy.contains_key(id) {
+            out.push(RecordChange::Remove { key: id.clone() });
+        }
+    }
+    out
 }
 
 /// F95Checker's data folder, the same place F95Checker itself uses (its
@@ -161,7 +218,10 @@ struct DbCopy {
 
 impl DbCopy {
     fn open(path: &Path) -> Result<DbCopy, String> {
-        let dir = std::env::temp_dir().join(format!("droidtop-agent-f95-adapter-{}", std::process::id()));
+        // One folder per read: two reads in one process (tests run in parallel) never share, or remove, each other's.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("droidtop-agent-f95-adapter-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let target = dir.join("db.sqlite");
         fs::copy(path, &target).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -219,6 +279,42 @@ fn now_s() -> i64 {
 }
 
 impl F95Checker {
+    /// Where the last snapshot is remembered: beside the database, like the backup.
+    fn base_path(&self) -> PathBuf {
+        self.db.with_file_name("db.sqlite3.droidtop-agent-snapshot.json")
+    }
+
+    fn base(&self) -> Records {
+        fs::read(self.base_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    fn remember(&self, records: &Records) -> Result<(), String> {
+        let path = self.base_path();
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_vec(records).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    }
+
+    /// F95Checker's threads now, remembered as the base for `received`.
+    fn snapshot(&self) -> Result<Records, String> {
+        let records = self.pull()?;
+        self.remember(&records)?;
+        Ok(records)
+    }
+
+    /// Brings the merged copy into F95Checker ([`changes_from`]), only while
+    /// it is closed; then the database as written is the new base.
+    fn received(&self, copy: Records) -> Result<Option<String>, String> {
+        if f95checker_running() {
+            return Ok(Some("F95Checker is open on the computer; the change is made there once it is closed".into()));
+        }
+        let changes = changes_from(&copy, &self.base(), &self.pull()?);
+        if let Some(deferred) = self.push(changes)? {
+            return Ok(Some(deferred));
+        }
+        self.snapshot().map(|_| None)
+    }
+
     fn pull(&self) -> Result<Records, String> {
         if !self.db.is_file() {
             return Err("F95Checker's database is not on this computer".into());
@@ -312,8 +408,8 @@ impl F95Checker {
 mod tests {
     use super::*;
 
-    fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dta-f95-adapter-test-{}", std::process::id()));
+    fn fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dta-f95-adapter-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("db.sqlite3");
@@ -334,7 +430,7 @@ mod tests {
 
     #[test]
     fn reads_threads_and_writes_only_the_writable_fields() {
-        let db = fixture();
+        let db = fixture("rw");
         let a = F95Checker { db: db.clone() };
         let records = a.pull().unwrap();
         assert_eq!(records.len(), 1);
@@ -358,6 +454,60 @@ mod tests {
         assert!(db.with_file_name("db.sqlite3.droidtop-agent-backup").is_file());
         a.push(vec![RecordChange::Remove { key: "200".into() }]).unwrap();
         assert!(!a.pull().unwrap().contains_key("200"));
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    fn rec(pairs: &[(&str, Value)]) -> Record {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn received_takes_only_what_the_handheld_changed() {
+        let base: Records = [("1".to_string(), rec(&[("name", json!("A")), ("installed", json!("0.1")), ("notes", json!(""))]))].into();
+        // Since the snapshot, F95Checker set notes and watched thread 3.
+        let now: Records = [
+            ("1".to_string(), rec(&[("name", json!("A")), ("installed", json!("0.1")), ("notes", json!("mine"))])),
+            ("3".to_string(), rec(&[("name", json!("C"))])),
+        ]
+        .into();
+        // The handheld changed installed (and sends the old notes), and watched thread 2.
+        let copy: Records = [
+            ("1".to_string(), rec(&[("name", json!("A2")), ("installed", json!("0.2")), ("notes", json!(""))])),
+            ("2".to_string(), rec(&[("name", json!("B")), ("url", json!("https://f95zone.to/threads/2/"))])),
+        ]
+        .into();
+        let changes = changes_from(&copy, &base, &now);
+        assert_eq!(
+            changes,
+            vec![
+                RecordChange::Upsert { key: "1".into(), fields: rec(&[("installed", json!("0.2"))]) },
+                RecordChange::Upsert {
+                    key: "2".into(),
+                    fields: rec(&[("name", json!("B")), ("url", json!("https://f95zone.to/threads/2/"))])
+                },
+            ],
+            "thread 3, F95Checker's notes and the computer-side name stay"
+        );
+        // Unwatched on the handheld: thread 1 goes, as the base had it.
+        let gone = changes_from(&Records::new(), &base, &now);
+        assert_eq!(gone, vec![RecordChange::Remove { key: "1".into() }]);
+    }
+
+    #[test]
+    fn a_snapshot_is_remembered_and_received_brings_the_copy_in() {
+        let db = fixture("snap");
+        let a = F95Checker { db: db.clone() };
+        let snap = a.snapshot().unwrap();
+        assert!(a.base_path().is_file());
+        if f95checker_running() {
+            return;
+        }
+        let mut copy = snap.clone();
+        copy.get_mut("100").unwrap().insert("installed".into(), json!("0.2"));
+        assert_eq!(a.received(copy).unwrap(), None);
+        assert_eq!(a.pull().unwrap()["100"]["installed"], json!("0.2"));
+        // The database as written is the new base.
+        assert_eq!(a.base()["100"]["installed"], json!("0.2"));
         let _ = fs::remove_dir_all(db.parent().unwrap());
     }
 }

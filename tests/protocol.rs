@@ -1,4 +1,4 @@
-//! The program as droidtop-agent runs it: adapter protocol 1 over standard
+//! The program as droidtop-agent runs it: adapter protocol 2 over standard
 //! input and output.
 
 use std::process::Command;
@@ -12,7 +12,8 @@ fn describe_names_the_context_and_protocol() {
     let out = Command::new(EXE).arg("describe").output().unwrap();
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["protocol"], json!(1));
+    assert_eq!(v["protocol"], json!(2));
+    assert_eq!(v["snapshot"], json!(true));
     assert_eq!(v["id"], json!("f95checker"));
 }
 

@@ -36,14 +36,26 @@ droidtop-agent contexts          # shows the f95checker context and its record c
 
 ## How droidtop-agent runs it
 
-Adapter protocol 1 (droidtop-agent's docs/DESIGN.md section 8): one run per
-sync, JSON over standard input and output.
+Adapter protocol 2 (droidtop-agent's docs/DESIGN.md section 8): JSON over
+standard input and output, one run per step. It needs a droidtop-agent that
+speaks protocol 2 with snapshots (Droidtop/tracker#794); an older agent says
+the adapter speaks a protocol it does not.
 
 ```
-droidtop-agent-f95-adapter describe   # {"protocol":1,"id":"f95checker","description":...}
-droidtop-agent-f95-adapter pull       # {"records":{"<thread id>":{"name":...,"installed":...}}}
-droidtop-agent-f95-adapter push       # reads {"changes":[...]}, prints {"deferred":null|"why"}
+droidtop-agent-f95-adapter describe   # {"protocol":2,"id":"f95checker","snapshot":true,...}
+droidtop-agent-f95-adapter snapshot   # {"records":{"<thread id>":{"name":...,"installed":...}}}
+droidtop-agent-f95-adapter received   # reads {"generation":n,"records":{...}}, prints {"deferred":null|"why"}
 ```
+
+- Before a handheld reads the context, the agent asks for a `snapshot` and
+  publishes it as the context's copy when it changed. The adapter remembers
+  that snapshot beside the database (`db.sqlite3.droidtop-agent-snapshot.json`).
+- After the handheld's merge, `received` brings into F95Checker only what the
+  handheld changed since that snapshot, so a change made in F95Checker in
+  between is kept. While F95Checker is open it waits, and the agent tells it
+  again at the next sync.
+- `pull` and `push` (protocol 1) still answer, for a plugin that syncs by
+  changes.
 
 ## Build
 
