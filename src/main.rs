@@ -231,6 +231,21 @@ impl DbCopy {
 }
 
 fn snapshot_database(source: &Path, target: &Path) -> Result<(), String> {
+    // SQLite otherwise creates the backup with its default file mode, which
+    // could expose account data even when the original database is private.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(target).map_err(|e| e.to_string())?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
     let conn = rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("{}: {e}", source.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
@@ -438,6 +453,11 @@ mod tests {
             .unwrap();
         let target = db.with_file_name("consistent-backup.sqlite3");
         snapshot_database(&db, &target).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let backup = rusqlite::Connection::open(&target).unwrap();
         assert_eq!(backup.query_row("SELECT name FROM games WHERE id=200", [], |r| r.get::<_, String>(0)).unwrap(), "In WAL");
     }
