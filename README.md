@@ -20,6 +20,9 @@ only while F95Checker is closed, because F95Checker keeps its database in
 memory and writes it back; while it is open, changes wait for the next sync.
 Before writing, it keeps one copy of the database beside it as
 `db.sqlite3.droidtop-agent-backup`.
+Snapshots and backups use SQLite's backup API, including committed data still in
+the write-ahead log. A failed row read rejects the entire snapshot; it never
+publishes a partial list as removals on the other device.
 
 ## Use
 

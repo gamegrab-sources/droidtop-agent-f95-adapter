@@ -208,9 +208,9 @@ fn columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     stmt.query_map([], |row| row.get::<_, String>(1)).map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
-/// A copy of the database (with its write-ahead log) in a temporary folder,
-/// removed when dropped: reading a copy never takes a lock F95Checker could
-/// trip over, and sees changes still in its log.
+/// A consistent SQLite snapshot in a temporary folder, removed when dropped.
+/// SQLite's backup API includes committed WAL content under its own read locks;
+/// independently copying the main file and WAL can combine different moments.
 struct DbCopy {
     dir: PathBuf,
     conn: rusqlite::Connection,
@@ -224,16 +224,17 @@ impl DbCopy {
         let dir = std::env::temp_dir().join(format!("droidtop-agent-f95-adapter-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let target = dir.join("db.sqlite");
-        fs::copy(path, &target).map_err(|e| format!("{}: {e}", path.display()))?;
-        for suffix in ["-wal", "-shm"] {
-            let side = PathBuf::from(format!("{}{suffix}", path.display()));
-            if side.is_file() {
-                let _ = fs::copy(&side, PathBuf::from(format!("{}{suffix}", target.display())));
-            }
-        }
+        snapshot_database(path, &target)?;
         let conn = rusqlite::Connection::open(&target).map_err(|e| e.to_string())?;
         Ok(DbCopy { dir, conn })
     }
+}
+
+fn snapshot_database(source: &Path, target: &Path) -> Result<(), String> {
+    let conn = rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("{}: {e}", source.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    conn.backup(rusqlite::DatabaseName::Main, target, None).map_err(|e| format!("could not snapshot F95Checker's database: {e}"))
 }
 
 impl Drop for DbCopy {
@@ -340,7 +341,7 @@ impl F95Checker {
                 Ok((id.to_string(), record))
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.flatten().collect())
+        rows.collect::<Result<Records, _>>().map_err(|e| format!("could not read the complete F95Checker snapshot: {e}"))
     }
 
     fn push(&self, changes: Vec<RecordChange>) -> Result<Option<String>, String> {
@@ -355,7 +356,7 @@ impl F95Checker {
         }
         // One copy of the database as it was before this adapter last wrote it.
         let backup = self.db.with_file_name("db.sqlite3.droidtop-agent-backup");
-        fs::copy(&self.db, &backup).map_err(|e| format!("could not back up F95Checker's database: {e}"))?;
+        snapshot_database(&self.db, &backup)?;
         let mut conn = rusqlite::Connection::open(&self.db).map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         let present = columns(&conn, "games");
@@ -426,6 +427,31 @@ mod tests {
         )
         .unwrap();
         db
+    }
+
+    #[test]
+    fn backup_contains_committed_wal_rows() {
+        let db = fixture("wal-backup");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO games (id, name) VALUES (200, 'In WAL');")
+            .unwrap();
+        let target = db.with_file_name("consistent-backup.sqlite3");
+        snapshot_database(&db, &target).unwrap();
+        let backup = rusqlite::Connection::open(&target).unwrap();
+        assert_eq!(backup.query_row("SELECT name FROM games WHERE id=200", [], |r| r.get::<_, String>(0)).unwrap(), "In WAL");
+    }
+
+    #[test]
+    fn invalid_row_does_not_replace_the_last_snapshot() {
+        let db = fixture("bad-row");
+        let adapter = F95Checker { db: db.clone() };
+        adapter.snapshot().unwrap();
+        let before = fs::read(adapter.base_path()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE games RENAME TO original_games; CREATE VIEW games AS SELECT 'invalid-id' AS id, custom, name, version, url, added_on, installed, finished, archived, rating, notes FROM original_games;").unwrap();
+        assert!(adapter.snapshot().is_err());
+        assert_eq!(fs::read(adapter.base_path()).unwrap(), before);
     }
 
     #[test]
