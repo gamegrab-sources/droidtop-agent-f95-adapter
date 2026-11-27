@@ -1,6 +1,6 @@
 name: Commit hygiene
 
-# The rule lives once, in Droidtop/droidtop-platforms, and is pinned by commit
+# The rule lives once, in mytop-project/droidtop-platforms, and is pinned by commit
 # (Droidtop/tracker#199).
 on:
   push:
@@ -11,4 +11,4 @@ permissions:
 
 jobs:
   hygiene:
-    uses: Droidtop/droidtop-platforms/.github/workflows/commit-hygiene.yml@84f44633fc5a8441abae8d6679d2fd27b39cd2ee
+    uses: mytop-project/droidtop-platforms/.github/workflows/commit-hygiene.yml@84f44633fc5a8441abae8d6679d2fd27b39cd2ee
